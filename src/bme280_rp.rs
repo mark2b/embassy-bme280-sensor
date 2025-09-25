@@ -5,7 +5,7 @@ use crate::{
     BME280Error, BME280Response, BME280_REGISTER_CHIPID,
     BME280_REGISTER_CONFIG, BME280_REGISTER_CONTROL, BME280_REGISTER_CONTROLHUMID,
     BME280_REGISTER_DATA_LENGTH, BME280_REGISTER_DATA_START, BME280_REGISTER_DIG_FIRST_LENGTH,
-    BME280_REGISTER_DIG_SECOND_LENGTH, BME280_REGISTER_SOFTRESET, BME280_REGISTER_STATUS, MIN_REQUEST_INTERVAL_SECS,
+    BME280_REGISTER_DIG_SECOND_LENGTH, BME280_REGISTER_SOFTRESET, BME280_REGISTER_STATUS,
 };
 use embassy_time::{with_timeout, Duration, Timer};
 use embedded_hal_async::i2c::I2c;
@@ -13,10 +13,7 @@ use embedded_hal_async::i2c::I2c;
 pub struct BME280Sensor<'a, T: I2c> {
     i2c: &'a mut T,
     address: u8,
-    last_response: Option<BME280Response>,
-    last_read_time: Option<embassy_time::Instant>,
     calibration_registers: Option<CalibrationRegisters>,
-    sampling_configuration: SamplingConfiguration,
 }
 
 impl<'a, T: I2c> BME280Sensor<'a, T> {
@@ -24,10 +21,7 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
         Self {
             i2c,
             address,
-            last_response: None,
-            last_read_time: None,
             calibration_registers: None,
-            sampling_configuration: SamplingConfiguration::default(),
         }
     }
 
@@ -86,26 +80,7 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
         )
         .await?;
 
-        self.calibration_registers = Some(CalibrationRegisters {
-            dig_t1: u16::from_le_bytes([data[0], data[1]]),
-            dig_t2: i16::from_le_bytes([data[2], data[3]]),
-            dig_t3: i16::from_le_bytes([data[4], data[5]]),
-            dig_p1: u16::from_le_bytes([data[6], data[7]]),
-            dig_p2: i16::from_le_bytes([data[8], data[9]]),
-            dig_p3: i16::from_le_bytes([data[10], data[11]]),
-            dig_p4: i16::from_le_bytes([data[12], data[13]]),
-            dig_p5: i16::from_le_bytes([data[14], data[15]]),
-            dig_p6: i16::from_le_bytes([data[16], data[17]]),
-            dig_p7: i16::from_le_bytes([data[18], data[19]]),
-            dig_p8: i16::from_le_bytes([data[20], data[21]]),
-            dig_p9: i16::from_le_bytes([data[22], data[23]]),
-            dig_h1: data[25],
-            dig_h2: i16::from_le_bytes([data[26], data[27]]),
-            dig_h3: data[28],
-            dig_h4: i16::from(data[29]) << 4 | i16::from(data[30]) & 0xf,
-            dig_h5: ((i16::from(data[30]) & 0xf0) >> 4) | (i16::from(data[31]) << 4),
-            dig_h6: data[32] as i8,
-        });
+        self.calibration_registers = Some(data.into());
 
         Ok(())
     }
@@ -114,10 +89,7 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
         &mut self,
         sampling_configuration: SamplingConfiguration,
     ) -> Result<(), BME280Error> {
-        self.sampling_configuration = sampling_configuration;
-
-        let (config, ctrl_meas, ctrl_hum) =
-            self.sampling_configuration.to_low_level_configuration();
+        let (config, ctrl_meas, ctrl_hum) = sampling_configuration.to_low_level_configuration();
 
         self.write_register_8u(BME280_REGISTER_CONTROL, SensorMode::Sleep as u8)
             .await?;
@@ -127,41 +99,10 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
             .await?;
         self.write_register_8u(BME280_REGISTER_CONTROL, ctrl_meas.into())
             .await?;
-        self.write_register_8u(BME280_REGISTER_CONTROL, SensorMode::Normal as u8)
-            .await?;
         Ok(())
     }
 
     pub async fn read(&mut self) -> Result<BME280Response, BME280Error> {
-        // let now = embassy_time::Instant::now();
-        // if let Some(last_read_time) = self.last_read_time {
-        //     if now - last_read_time < Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) {
-        //         if let Some(response) = &self.last_response {
-        //             return Ok(response.clone());
-        //         }
-        //     }
-        // } else {
-        //     if now.as_secs() < MIN_REQUEST_INTERVAL_SECS {
-        //         return Err(BME280Error::NoData);
-        //     }
-        // }
-        match self.read_internal().await {
-            Ok(response) => {
-                self.last_response = Some(response.clone());
-                self.last_read_time = Some(embassy_time::Instant::now());
-                Ok(response)
-            }
-            Err(e) => {
-                if let Some(response) = &self.last_response {
-                    Ok(response.clone())
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    async fn read_internal(&mut self) -> Result<BME280Response, BME280Error> {
         let mut data: [u8; BME280_REGISTER_DATA_LENGTH] = [0; BME280_REGISTER_DATA_LENGTH];
         self.read_registers_bulk(BME280_REGISTER_DATA_START, &mut data)
             .await?;

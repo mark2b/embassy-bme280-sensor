@@ -1,3 +1,5 @@
+use crate::{BME280_REGISTER_DIG_FIRST_LENGTH, BME280_REGISTER_DIG_SECOND_LENGTH};
+
 pub struct CalibrationRegisters {
     pub dig_t1: u16,
     pub dig_t2: i16,
@@ -17,6 +19,35 @@ pub struct CalibrationRegisters {
     pub dig_h4: i16,
     pub dig_h5: i16,
     pub dig_h6: i8,
+}
+
+impl From<[u8; BME280_REGISTER_DIG_FIRST_LENGTH + BME280_REGISTER_DIG_SECOND_LENGTH]>
+    for CalibrationRegisters
+{
+    fn from(
+        value: [u8; BME280_REGISTER_DIG_FIRST_LENGTH + BME280_REGISTER_DIG_SECOND_LENGTH],
+    ) -> Self {
+        Self {
+            dig_t1: u16::from_le_bytes([value[0], value[1]]),
+            dig_t2: i16::from_le_bytes([value[2], value[3]]),
+            dig_t3: i16::from_le_bytes([value[4], value[5]]),
+            dig_p1: u16::from_le_bytes([value[6], value[7]]),
+            dig_p2: i16::from_le_bytes([value[8], value[9]]),
+            dig_p3: i16::from_le_bytes([value[10], value[11]]),
+            dig_p4: i16::from_le_bytes([value[12], value[13]]),
+            dig_p5: i16::from_le_bytes([value[14], value[15]]),
+            dig_p6: i16::from_le_bytes([value[16], value[17]]),
+            dig_p7: i16::from_le_bytes([value[18], value[19]]),
+            dig_p8: i16::from_le_bytes([value[20], value[21]]),
+            dig_p9: i16::from_le_bytes([value[22], value[23]]),
+            dig_h1: value[25],
+            dig_h2: i16::from_le_bytes([value[26], value[27]]),
+            dig_h3: value[28],
+            dig_h4: i16::from(value[29]) << 4 | i16::from(value[30]) & 0xf,
+            dig_h5: ((i16::from(value[30]) & 0xf0) >> 4) | (i16::from(value[31]) << 4),
+            dig_h6: value[32] as i8,
+        }
+    }
 }
 
 impl CalibrationRegisters {

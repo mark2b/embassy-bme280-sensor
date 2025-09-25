@@ -150,8 +150,8 @@ pub enum StandbyDuration {
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum Oversampling {
-    Skip = 0b000,
     #[default]
+    Skip = 0b000,
     X1 = 0b001,
     X2 = 0b010,
     X4 = 0b011,

@@ -23,7 +23,6 @@ name = "embassy_bme280_sensor"
 path = "src/lib.rs"
 
 [dependencies]
-cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 
 embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
@@ -33,13 +32,5 @@ embassy-rp = { version = "0.8.0", features = ["rp2040", "defmt", "unstable-pac",
 defmt = { version = "1", optional = true }
 defmt-rtt = { version = "1", optional = true }
 panic-probe = { version = "1", features = ["print-defmt"], optional = true }
-fixed = "1.29"
-embassy-embedded-hal = "0.5.0"
 embedded-hal-async = "1.0.0"
-embedded-hal = "0.2.7"
-
-[dev-dependencies]
-embassy-usb-logger = "0.5.1"
-embassy-usb = "0.5.1"
-log = "0.4.28"
 

@@ -5,8 +5,6 @@ pub mod bme280_rp;
 pub mod calibration;
 pub mod configuration;
 
-const MIN_REQUEST_INTERVAL_SECS: u64 = 1;
-
 const BME280_REGISTER_CHIPID: u8 = 0xD0;
 const BME280_REGISTER_SOFTRESET: u8 = 0xE0;
 const BME280_REGISTER_STATUS: u8 = 0xF3;
@@ -38,8 +36,6 @@ pub struct BME280Response {
 #[derive(Debug, Clone)]
 pub enum BME280Error {
     NoData,
-    ChecksumError,
-    InvalidData,
     I2CError,
     InvalidChipId(u8),
     Timeout,
