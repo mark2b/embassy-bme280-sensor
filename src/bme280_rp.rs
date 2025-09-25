@@ -1,22 +1,36 @@
-use crate::calibration::CalibrationRegisters;
-use crate::configuration::{SamplingConfiguration, SensorMode};
-use crate::BME280Error::NotCalibrated;
+use crate::calibration::CalibrationData;
+use crate::configuration::{Configuration, Filter, Oversampling, SensorMode, StandbyDuration};
+use crate::BME280Error::{InvalidData, NoData};
 use crate::{
     BME280Error, BME280Response, BME280_REGISTER_CHIPID,
     BME280_REGISTER_CONFIG, BME280_REGISTER_CONTROL, BME280_REGISTER_CONTROLHUMID,
-    BME280_REGISTER_DATA_LENGTH, BME280_REGISTER_DATA_START, BME280_REGISTER_DIG_FIRST_LENGTH,
-    BME280_REGISTER_DIG_SECOND_LENGTH, BME280_REGISTER_SOFTRESET, BME280_REGISTER_STATUS, MIN_REQUEST_INTERVAL_SECS,
+    BME280_REGISTER_DIG_FIRST_END, BME280_REGISTER_DIG_FIRST_LENGTH, BME280_REGISTER_DIG_FIRST_START,
+    BME280_REGISTER_DIG_H1, BME280_REGISTER_DIG_H2, BME280_REGISTER_DIG_H3, BME280_REGISTER_DIG_H4,
+    BME280_REGISTER_DIG_H5, BME280_REGISTER_DIG_H6, BME280_REGISTER_DIG_P1, BME280_REGISTER_DIG_P2,
+    BME280_REGISTER_DIG_P3, BME280_REGISTER_DIG_P4, BME280_REGISTER_DIG_P5, BME280_REGISTER_DIG_P6,
+    BME280_REGISTER_DIG_P7, BME280_REGISTER_DIG_P8, BME280_REGISTER_DIG_P9,
+    BME280_REGISTER_DIG_SECOND_END, BME280_REGISTER_DIG_SECOND_LENGTH, BME280_REGISTER_DIG_SECOND_START,
+    BME280_REGISTER_DIG_T1, BME280_REGISTER_DIG_T2, BME280_REGISTER_DIG_T3,
+    BME280_REGISTER_PRESSUREDATA, BME280_REGISTER_SOFTRESET, BME280_REGISTER_STATUS, BME280_REGISTER_TEMPDATA,
 };
-use embassy_time::{with_timeout, Duration, Timer};
+use core::cmp::PartialEq;
+use defmt::info;
+use embassy_time::Timer;
 use embedded_hal_async::i2c::I2c;
+
+macro_rules! concat_bytes {
+    ($msb:expr, $lsb:expr) => {
+        (($msb as u16) << 8) | ($lsb as u16)
+    };
+}
 
 pub struct BME280Sensor<'a, T: I2c> {
     i2c: &'a mut T,
     address: u8,
     last_response: Option<BME280Response>,
     last_read_time: Option<embassy_time::Instant>,
-    calibration_registers: Option<CalibrationRegisters>,
-    sampling_configuration: SamplingConfiguration,
+    calibration_data: Option<CalibrationData>,
+    configuration: Configuration,
 }
 
 impl<'a, T: I2c> BME280Sensor<'a, T> {
@@ -26,67 +40,54 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
             address,
             last_response: None,
             last_read_time: None,
-            calibration_registers: None,
-            sampling_configuration: SamplingConfiguration::default(),
+            calibration_data: None,
+            configuration: Configuration::default(),
         }
     }
 
-    pub async fn setup(
-        &mut self,
-        sampling_configuration: SamplingConfiguration,
-    ) -> Result<(), BME280Error> {
-        let chip_id = self.read_register_u8(BME280_REGISTER_CHIPID).await?;
+    pub async fn setup(&mut self) -> Result<(), BME280Error> {
+        let chip_id = self.read_register_8bit(BME280_REGISTER_CHIPID).await?;
         if chip_id != 0x60 {
             return Err(BME280Error::InvalidChipId(chip_id));
         }
-        self.write_register_8u(BME280_REGISTER_SOFTRESET, 0x86)
+        self.write_register_8bit(BME280_REGISTER_SOFTRESET, 0x86)
             .await?;
-        Timer::after(Duration::from_millis(10)).await;
-        let timeout = with_timeout(Duration::from_secs(1), async {
-            loop {
-                match self.is_reading_calibration().await {
-                    Ok(reading) => {
-                        if reading {
-                            Timer::after(Duration::from_millis(10)).await;
-                        } else {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-        })
-        .await;
-        if let Err(_) = timeout {
-            return Err(BME280Error::Timeout);
+        Timer::after(embassy_time::Duration::from_millis(10)).await;
+        while self.is_reading_calibration().await? {
+            Timer::after(embassy_time::Duration::from_millis(10)).await;
         }
-
         self.read_coefficients().await?;
-        self.set_sampling_configuration(sampling_configuration)
-            .await?;
+        self.set_sampling_configuration(
+            Configuration::default()
+                .with_temperature_oversampling(Oversampling::Oversample2)
+                .with_pressure_oversampling(Oversampling::Oversample2)
+                .with_humidity_oversampling(Oversampling::Oversample2)
+                .with_sensor_mode(SensorMode::Normal)
+                .with_standby_duration(StandbyDuration::Millis1000)
+                .with_filter(Filter::FilterX2),
+        )
+        .await?;
         Timer::after(embassy_time::Duration::from_millis(100)).await;
         Ok(())
     }
 
     async fn is_reading_calibration(&mut self) -> Result<bool, BME280Error> {
-        let status = self.read_register_u8(BME280_REGISTER_STATUS).await?;
+        let status = self.read_register_8bit(BME280_REGISTER_STATUS).await?;
         Ok((status & (1 << 3)) != 0)
     }
 
     async fn read_coefficients(&mut self) -> Result<(), BME280Error> {
         let mut data = [0u8; BME280_REGISTER_DIG_FIRST_LENGTH + BME280_REGISTER_DIG_SECOND_LENGTH];
-        self.read_registers_bulk(0x88, &mut data[0..BME280_REGISTER_DIG_FIRST_LENGTH])
+        self.read_raw(0x88, &mut data[0..BME280_REGISTER_DIG_FIRST_LENGTH])
             .await?;
-        self.read_registers_bulk(
+        self.read_raw(
             0xE1,
             &mut data[BME280_REGISTER_DIG_FIRST_LENGTH
                 ..BME280_REGISTER_DIG_FIRST_LENGTH + BME280_REGISTER_DIG_SECOND_LENGTH],
         )
         .await?;
 
-        self.calibration_registers = Some(CalibrationRegisters {
+        self.calibration_data = Some(CalibrationData {
             dig_t1: u16::from_le_bytes([data[0], data[1]]),
             dig_t2: i16::from_le_bytes([data[2], data[3]]),
             dig_t3: i16::from_le_bytes([data[4], data[5]]),
@@ -112,58 +113,26 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
 
     async fn set_sampling_configuration(
         &mut self,
-        sampling_configuration: SamplingConfiguration,
+        configuration: Configuration,
     ) -> Result<(), BME280Error> {
-        self.sampling_configuration = sampling_configuration;
+        self.configuration = configuration;
 
-        let (config, ctrl_meas, ctrl_hum) =
-            self.sampling_configuration.to_low_level_configuration();
+        let (config, ctrl_meas, ctrl_hum) = self.configuration.to_low_level_configuration();
 
-        self.write_register_8u(BME280_REGISTER_CONTROL, SensorMode::Sleep as u8)
+        self.write_register_8bit(BME280_REGISTER_CONTROL, SensorMode::Sleep.into())
             .await?;
-        self.write_register_8u(BME280_REGISTER_CONTROLHUMID, ctrl_hum.into())
+        self.write_register_8bit(BME280_REGISTER_CONTROLHUMID, ctrl_hum.into())
             .await?;
-        self.write_register_8u(BME280_REGISTER_CONFIG, config.into())
+        self.write_register_8bit(BME280_REGISTER_CONFIG, config.into())
             .await?;
-        self.write_register_8u(BME280_REGISTER_CONTROL, ctrl_meas.into())
-            .await?;
-        self.write_register_8u(BME280_REGISTER_CONTROL, SensorMode::Normal as u8)
+        self.write_register_8bit(BME280_REGISTER_CONTROL, ctrl_meas.into())
             .await?;
         Ok(())
     }
 
     pub async fn read(&mut self) -> Result<BME280Response, BME280Error> {
-        // let now = embassy_time::Instant::now();
-        // if let Some(last_read_time) = self.last_read_time {
-        //     if now - last_read_time < Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) {
-        //         if let Some(response) = &self.last_response {
-        //             return Ok(response.clone());
-        //         }
-        //     }
-        // } else {
-        //     if now.as_secs() < MIN_REQUEST_INTERVAL_SECS {
-        //         return Err(BME280Error::NoData);
-        //     }
-        // }
-        match self.read_internal().await {
-            Ok(response) => {
-                self.last_response = Some(response.clone());
-                self.last_read_time = Some(embassy_time::Instant::now());
-                Ok(response)
-            }
-            Err(e) => {
-                if let Some(response) = &self.last_response {
-                    Ok(response.clone())
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    async fn read_internal(&mut self) -> Result<BME280Response, BME280Error> {
-        let mut data: [u8; BME280_REGISTER_DATA_LENGTH] = [0; BME280_REGISTER_DATA_LENGTH];
-        self.read_registers_bulk(BME280_REGISTER_DATA_START, &mut data)
+        let mut data: [u8; 8] = [0; 8];
+        self.read_raw(BME280_REGISTER_PRESSUREDATA, &mut data)
             .await?;
 
         let data_msb = (data[0] as u32) << 12;
@@ -180,38 +149,57 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
         let data_lsb = data[7] as u32;
         let adc_h = data_msb | data_lsb;
 
-        if let Some(cr) = &self.calibration_registers {
-            let t_fine = cr.compensate_temperature(adc_t);
-            let temperature = ((t_fine * 5 + 128) >> 8) as f32 / 100.0;
-            let humidity = cr.compensate_humidity(adc_h as u16, t_fine) as f32 / 1024.0;
-            let pressure = cr.compensate_pressure(adc_p, t_fine) as f32 / 256.0;
+        let cd = self.calibration_data.as_ref().unwrap();
 
-            Ok(BME280Response {
-                temperature,
-                humidity,
-                pressure,
-            })
-        } else {
-            Err(NotCalibrated)
-        }
+        let t_fine = cd.compensate_temperature(adc_t);
+        let temperature = ((t_fine * 5 + 128) >> 8) as f32 / 100.0;
+        let humidity = cd.compensate_humidity(adc_h as u16, t_fine) as f32 / 1024.0;
+        let pressure = cd.compensate_pressure(adc_p, t_fine) as f32 / 256.0;
+
+        Ok(BME280Response {
+            temperature,
+            humidity,
+            pressure,
+        })
     }
 
-    async fn read_register_u8(&mut self, register: u8) -> Result<u8, BME280Error> {
+    async fn read_register_8bit(&mut self, register: u8) -> Result<u8, BME280Error> {
         let mut buf = [0u8; 1];
         self.i2c_write_read(&[register], &mut buf).await?;
         Ok(buf[0])
     }
 
-    async fn write_register_8u(&mut self, register: u8, data: u8) -> Result<(), BME280Error> {
+    async fn read_register_16bit(&mut self, register: u8) -> Result<u16, BME280Error> {
+        let mut buf = [0u8; 2];
+        self.i2c_write_read(&[register], &mut buf).await?;
+        Ok(u16::from_be_bytes(buf))
+    }
+
+    async fn read_register_16bit_le(&mut self, register: u8) -> Result<u16, BME280Error> {
+        let mut buf = [0u8; 2];
+        self.i2c_write_read(&[register], &mut buf).await?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    async fn read_raw_pth(&mut self) -> Result<u64, BME280Error> {
+        let mut buf = [0u8; 3 + 3 + 2];
+        self.i2c_write_read(&[BME280_REGISTER_PRESSUREDATA], &mut buf)
+            .await?;
+        Ok(u64::from_be_bytes(buf))
+    }
+
+    async fn read_register_24bit(&mut self, register: u8) -> Result<u32, BME280Error> {
+        let mut buf = [0u8; 4];
+        self.i2c_write_read(&[register], &mut buf).await?;
+        Ok(u32::from_be_bytes(buf))
+    }
+
+    async fn write_register_8bit(&mut self, register: u8, data: u8) -> Result<(), BME280Error> {
         self.i2c_write(&[register, data]).await?;
         Ok(())
     }
 
-    async fn read_registers_bulk(
-        &mut self,
-        register: u8,
-        read: &mut [u8],
-    ) -> Result<(), BME280Error> {
+    async fn read_raw(&mut self, register: u8, read: &mut [u8]) -> Result<(), BME280Error> {
         self.i2c_write_read(&[register], read).await?;
         Ok(())
     }
@@ -219,14 +207,14 @@ impl<'a, T: I2c> BME280Sensor<'a, T> {
     async fn i2c_write_read(&mut self, write: &[u8], read: &mut [u8]) -> Result<(), BME280Error> {
         match self.i2c.write_read(self.address, write, read).await {
             Ok(_) => Ok(()),
-            Err(_) => Err(BME280Error::I2CError),
+            Err(e) => Err(BME280Error::I2CError),
         }
     }
 
     async fn i2c_write(&mut self, write: &[u8]) -> Result<(), BME280Error> {
         match self.i2c.write(self.address, write).await {
             Ok(_) => Ok(()),
-            Err(_) => Err(BME280Error::I2CError),
+            Err(e) => Err(BME280Error::I2CError),
         }
     }
 }

@@ -1,25 +1,42 @@
-pub struct CalibrationRegisters {
+pub struct CalibrationData {
     pub dig_t1: u16,
+    // temperature compensation value
     pub dig_t2: i16,
-    pub dig_t3: i16,
+    // temperature compensation value
+    pub dig_t3: i16, // temperature compensation value
+
     pub dig_p1: u16,
+    // pressure compensation value
     pub dig_p2: i16,
+    // pressure compensation value
     pub dig_p3: i16,
+    // pressure compensation value
     pub dig_p4: i16,
+    // pressure compensation value
     pub dig_p5: i16,
+    // pressure compensation value
     pub dig_p6: i16,
+    // pressure compensation value
     pub dig_p7: i16,
+    // pressure compensation value
     pub dig_p8: i16,
-    pub dig_p9: i16,
+    // pressure compensation value
+    pub dig_p9: i16, // pressure compensation value
+
     pub dig_h1: u8,
+    // humidity compensation value
     pub dig_h2: i16,
+    // humidity compensation value
     pub dig_h3: u8,
+    // humidity compensation value
     pub dig_h4: i16,
+    // humidity compensation value
     pub dig_h5: i16,
-    pub dig_h6: i8,
+    // humidity compensation value
+    pub dig_h6: i8, // humidity compensation value
 }
 
-impl CalibrationRegisters {
+impl CalibrationData {
     pub fn compensate_temperature(&self, adc_t: i32) -> i32 {
         let var1 = (((adc_t >> 3) - (i32::from(self.dig_t1) << 1)) * i32::from(self.dig_t2)) >> 11;
         let var2 = (((((adc_t >> 4) - i32::from(self.dig_t1))
@@ -57,7 +74,10 @@ impl CalibrationRegisters {
         };
 
         let humidity = v_x1_u32r >> 12;
-        humidity as u32
+
+        let humidity = humidity as u32;
+
+        humidity
     }
 
     pub fn compensate_pressure(&self, adc_p: u32, t_fine: i32) -> u32 {
@@ -70,6 +90,7 @@ impl CalibrationRegisters {
         let var1 = ((((1_i64) << 47) + var1) * i64::from(self.dig_p1)) >> 33;
 
         if var1 == 0 {
+            // division by zero
             0
         } else {
             let var4 = 1_048_576 - i64::from(adc_p);
@@ -79,6 +100,9 @@ impl CalibrationRegisters {
             let var5 = ((var4 + var1 + var2) >> 8) + (i64::from(self.dig_p7) << 4);
 
             let p = var5;
+
+            #[allow(clippy::cast_sign_loss)] // Using reference algorithm
+            #[allow(clippy::cast_possible_truncation)] // Acceptable truncation
             let pressure = p as u32;
 
             pressure
