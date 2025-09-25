@@ -1,7 +1,5 @@
-use crate::{Filter, Oversampling, SensorMode, StandbyDuration};
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Configuration {
+pub struct SamplingConfiguration {
     standby_duration: StandbyDuration,
     filter: Filter,
     spi3w: bool,
@@ -11,80 +9,83 @@ pub struct Configuration {
     sensor_mode: SensorMode,
 }
 
-impl Configuration {
+impl From<&SamplingConfiguration> for (Config, ControlMeasurement, ControlHumidity) {
+    fn from(configuration: &SamplingConfiguration) -> Self {
+        let config = (
+            configuration.standby_duration.clone(),
+            configuration.filter.clone(),
+            configuration.spi3w,
+        )
+            .into();
+        let control_measurement = (
+            configuration.temperature_oversampling,
+            configuration.pressure_oversampling,
+            configuration.sensor_mode,
+        )
+            .into();
+        let control_humidity = configuration.humidity_oversampling.into();
+        (config, control_measurement, control_humidity)
+    }
+}
+
+impl SamplingConfiguration {
     pub(crate) fn to_low_level_configuration(
         &self,
     ) -> (Config, ControlMeasurement, ControlHumidity) {
         self.into()
     }
 
-    /// Set the standby time
-    #[must_use]
-    pub fn with_standby_time(mut self, standby_time: StandbyTime) -> Self {
-        self.standby_time = standby_time;
+    pub fn with_standby_time(mut self, standby_duration: StandbyDuration) -> Self {
+        self.standby_duration = standby_duration;
         self
     }
 
-    /// Set the filter
-    #[must_use]
     pub fn with_filter(mut self, filter: Filter) -> Self {
         self.filter = filter;
         self
     }
 
-    /// Set the SPI3w option
-    #[doc(hidden)]
     #[allow(unused)]
     pub(crate) fn with_spi3w(mut self, spi3w: bool) -> Self {
         self.spi3w = spi3w;
         self
     }
 
-    /// Set the oversampling factor for temperature
-    #[must_use]
     pub fn with_temperature_oversampling(mut self, temperature_oversampling: Oversampling) -> Self {
         self.temperature_oversampling = temperature_oversampling;
         self
     }
 
-    /// Set the oversampling factor for pressure
-    #[must_use]
     pub fn with_pressure_oversampling(mut self, pressure_oversampling: Oversampling) -> Self {
         self.pressure_oversampling = pressure_oversampling;
         self
     }
 
-    /// Set the oversampling factor for humidity
-    #[must_use]
     pub fn with_humidity_oversampling(mut self, humidity_oversampling: Oversampling) -> Self {
         self.humidity_oversampling = humidity_oversampling;
         self
     }
 
-    /// Set the sensor mode
-    #[must_use]
     pub fn with_sensor_mode(mut self, sensor_mode: SensorMode) -> Self {
         self.sensor_mode = sensor_mode;
         self
     }
 
-    /// Check if chip is in forced mode
-    #[doc(hidden)]
-    pub(crate) fn is_forced(&self) -> bool {
-        self.sensor_mode == SensorMode::Forced
+    pub fn with_standby_duration(mut self, standby_duration: StandbyDuration) -> Self {
+        self.standby_duration = standby_duration;
+        self
     }
 }
 
-/// Low-level config item
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Config(u8);
 
-impl From<(StandbyTime, Filter, bool)> for Config {
-    fn from((standby_time, filter, spi3w): (StandbyTime, Filter, bool)) -> Self {
-        let standby_time = standby_time.to_value() & 0b111;
-        let filter = filter.to_value() & 0b111;
+impl From<(StandbyDuration, Filter, bool)> for Config {
+    fn from((standby_duration, filter, spi3w): (StandbyDuration, Filter, bool)) -> Self {
+        let standby_duration = (standby_duration as u8) & 0b111;
+        let filter = (filter as u8) & 0b111;
         let spi3w = u8::from(spi3w) & 0b1;
-        Self(standby_time << 5 | filter << 2 | spi3w)
+        Self(standby_duration << 5 | filter << 2 | spi3w)
     }
 }
 
@@ -94,13 +95,12 @@ impl From<Config> for u8 {
     }
 }
 
-/// Low-level control humidity item
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ControlHumidity(u8);
 
 impl From<Oversampling> for ControlHumidity {
     fn from(humidity_oversampling: Oversampling) -> Self {
-        Self(humidity_oversampling.to_value() & 0b111)
+        Self((humidity_oversampling as u8) & 0b111)
     }
 }
 
@@ -110,56 +110,71 @@ impl From<ControlHumidity> for u8 {
     }
 }
 
-/// Low-level control measurement item
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ControlMeasurement(u8);
 
+impl From<(Oversampling, Oversampling, SensorMode)> for ControlMeasurement {
+    fn from(
+        (oversampling_temperature, oversampling_pressure, sensor_mode): (
+            Oversampling,
+            Oversampling,
+            SensorMode,
+        ),
+    ) -> Self {
+        let oversampling_temperature = (oversampling_temperature as u8) & 0b111;
+        let oversampling_pressure = (oversampling_pressure as u8) & 0b111;
+        let sensor_mode = (sensor_mode as u8) & 0b11;
+        Self(oversampling_temperature << 5 | oversampling_pressure << 2 | sensor_mode)
+    }
+}
+
+impl From<ControlMeasurement> for u8 {
+    fn from(ctrl_meas: ControlMeasurement) -> Self {
+        ctrl_meas.0
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
-enum StandbyDuration {
+pub enum StandbyDuration {
     #[default]
-    Standby0_5ms = 0b000,
-    Standby10ms = 0b110,
-    Oversample2,
-    Oversample4,
-    Oversample8,
-    Oversample16,
+    Millis0_5 = 0b000,
+    Millis10 = 0b110,
+    Millis20 = 0b111,
+    Millis62_5 = 0b001,
+    Millis125 = 0b010,
+    Millis250 = 0b011,
+    Millis500 = 0b100,
+    Millis1000 = 0b101,
 }
 
-/// Oversampling setting
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum Oversampling {
-    /// Skip the measurement altogether
-    Skip,
-    /// Take a single sample
-    Oversample1,
-    /// Take two samples
-    Oversample2,
-    /// Take four samples
-    Oversample4,
-    /// Take eight samples
-    Oversample8,
-    /// Take sixteen samples
-    Oversample16,
+    Skip = 0b000,
+    #[default]
+    X1 = 0b001,
+    X2 = 0b010,
+    X4 = 0b011,
+    X8 = 0b100,
+    X16 = 0b101,
 }
 
-impl crate::Oversampling {
-    /// Convert to binary value
-    pub(crate) fn to_value(self) -> u8 {
-        match self {
-            Self::Skip => 0b000,
-            Self::Oversample1 => 0b001,
-            Self::Oversample2 => 0b010,
-            Self::Oversample4 => 0b011,
-            Self::Oversample8 => 0b100,
-            Self::Oversample16 => 0b101,
-        }
-    }
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SensorMode {
+    #[default]
+    Sleep = 0b00,
+    Forced = 0b01,
+    Normal = 0b11,
 }
 
-impl Default for crate::Oversampling {
-    fn default() -> Self {
-        Self::Skip
-    }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Filter {
+    #[default]
+    Off = 0b000,
+    X2 = 0b001,
+    X4 = 0b010,
+    X8 = 0b011,
+    X16 = 0b100,
 }

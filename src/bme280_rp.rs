@@ -1,63 +1,155 @@
-use crate::DTHResponse;
-use crate::DHTSensorError::InvalidData;
+use crate::calibration::CalibrationRegisters;
+use crate::configuration::{SamplingConfiguration, SensorMode};
+use crate::BME280Error::NotCalibrated;
 use crate::{
-    DHTSensorError,
+    BME280Error, BME280Response, BME280_REGISTER_CHIPID,
+    BME280_REGISTER_CONFIG, BME280_REGISTER_CONTROL, BME280_REGISTER_CONTROLHUMID,
+    BME280_REGISTER_DATA_LENGTH, BME280_REGISTER_DATA_START, BME280_REGISTER_DIG_FIRST_LENGTH,
+    BME280_REGISTER_DIG_SECOND_LENGTH, BME280_REGISTER_SOFTRESET, BME280_REGISTER_STATUS, MIN_REQUEST_INTERVAL_SECS,
 };
-use cortex_m::interrupt::free;
-use embassy_rp::gpio::Level::{High, Low};
-use embassy_rp::gpio::{Flex, Level, Pull};
-use embassy_time::{block_for, Duration};
+use embassy_time::{with_timeout, Duration, Timer};
+use embedded_hal_async::i2c::I2c;
 
-const WAIT_FOR_READINESS_LEVEL_THRESHOLD: u32 = 80;
-const LOW_LEVEL_THRESHOLD: u32 = 55;
-const HIGH_LEVEL_THRESHOLD: u32 = 75;
-
-pub struct DHTSensor<'a> {
-    pin: Flex<'a>,
-    last_response: Option<DTHResponse>,
+pub struct BME280Sensor<'a, T: I2c> {
+    i2c: &'a mut T,
+    address: u8,
+    last_response: Option<BME280Response>,
     last_read_time: Option<embassy_time::Instant>,
+    calibration_registers: Option<CalibrationRegisters>,
+    sampling_configuration: SamplingConfiguration,
 }
 
-impl<'a> DHTSensor<'a> {
-    pub fn new(pin: Flex<'a>) -> Self {
-        DHTSensor {
-            pin,
+impl<'a, T: I2c> BME280Sensor<'a, T> {
+    pub fn new(i2c: &'a mut T, address: u8) -> Self {
+        Self {
+            i2c,
+            address,
             last_response: None,
             last_read_time: None,
+            calibration_registers: None,
+            sampling_configuration: SamplingConfiguration::default(),
         }
     }
 
-    pub fn read(&mut self) -> Result<DTHResponse, DHTSensorError> {
-        let now = embassy_time::Instant::now();
-        if let Some(last_read_time) = self.last_read_time {
-            if now - last_read_time < Duration::from_secs(crate::dht::MIN_REQUEST_INTERVAL_SECS) {
-                if let Some(response) = &self.last_response {
-                    return Ok(response.clone());
-                }
-            }
+    pub async fn setup(
+        &mut self,
+        sampling_configuration: SamplingConfiguration,
+    ) -> Result<(), BME280Error> {
+        let chip_id = self.read_register_u8(BME280_REGISTER_CHIPID).await?;
+        if chip_id != 0x60 {
+            return Err(BME280Error::InvalidChipId(chip_id));
         }
-        match self.read_raw_data() {
-            Ok(data) => {
-                let humidity_data: &[u16; 2] = &data[0..2].try_into().unwrap();
-                let humidity = dht::humidity(humidity_data);
-                let temperature_data: &[u16; 2] = &data[2..4].try_into().unwrap();
-                let temperature = dht::temperature(temperature_data);
-                if humidity <= 100.0 {
-                    let response = DTHResponse {
-                        humidity,
-                        temperature,
-                    };
-                    self.last_response = Some(response.clone());
-                    self.last_read_time = Some(embassy_time::Instant::now());
-                    Ok(response)
-                }
-                else {
-                    if let Some(response) = &self.last_response {
-                        Ok(response.clone())
-                    } else {
-                        Err(InvalidData)
+        self.write_register_8u(BME280_REGISTER_SOFTRESET, 0x86)
+            .await?;
+        Timer::after(Duration::from_millis(10)).await;
+        let timeout = with_timeout(Duration::from_secs(1), async {
+            loop {
+                match self.is_reading_calibration().await {
+                    Ok(reading) => {
+                        if reading {
+                            Timer::after(Duration::from_millis(10)).await;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        break;
                     }
                 }
+            }
+        })
+        .await;
+        if let Err(_) = timeout {
+            return Err(BME280Error::Timeout);
+        }
+
+        self.read_coefficients().await?;
+        self.set_sampling_configuration(sampling_configuration)
+            .await?;
+        Timer::after(embassy_time::Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    async fn is_reading_calibration(&mut self) -> Result<bool, BME280Error> {
+        let status = self.read_register_u8(BME280_REGISTER_STATUS).await?;
+        Ok((status & (1 << 3)) != 0)
+    }
+
+    async fn read_coefficients(&mut self) -> Result<(), BME280Error> {
+        let mut data = [0u8; BME280_REGISTER_DIG_FIRST_LENGTH + BME280_REGISTER_DIG_SECOND_LENGTH];
+        self.read_registers_bulk(0x88, &mut data[0..BME280_REGISTER_DIG_FIRST_LENGTH])
+            .await?;
+        self.read_registers_bulk(
+            0xE1,
+            &mut data[BME280_REGISTER_DIG_FIRST_LENGTH
+                ..BME280_REGISTER_DIG_FIRST_LENGTH + BME280_REGISTER_DIG_SECOND_LENGTH],
+        )
+        .await?;
+
+        self.calibration_registers = Some(CalibrationRegisters {
+            dig_t1: u16::from_le_bytes([data[0], data[1]]),
+            dig_t2: i16::from_le_bytes([data[2], data[3]]),
+            dig_t3: i16::from_le_bytes([data[4], data[5]]),
+            dig_p1: u16::from_le_bytes([data[6], data[7]]),
+            dig_p2: i16::from_le_bytes([data[8], data[9]]),
+            dig_p3: i16::from_le_bytes([data[10], data[11]]),
+            dig_p4: i16::from_le_bytes([data[12], data[13]]),
+            dig_p5: i16::from_le_bytes([data[14], data[15]]),
+            dig_p6: i16::from_le_bytes([data[16], data[17]]),
+            dig_p7: i16::from_le_bytes([data[18], data[19]]),
+            dig_p8: i16::from_le_bytes([data[20], data[21]]),
+            dig_p9: i16::from_le_bytes([data[22], data[23]]),
+            dig_h1: data[25],
+            dig_h2: i16::from_le_bytes([data[26], data[27]]),
+            dig_h3: data[28],
+            dig_h4: i16::from(data[29]) << 4 | i16::from(data[30]) & 0xf,
+            dig_h5: ((i16::from(data[30]) & 0xf0) >> 4) | (i16::from(data[31]) << 4),
+            dig_h6: data[32] as i8,
+        });
+
+        Ok(())
+    }
+
+    async fn set_sampling_configuration(
+        &mut self,
+        sampling_configuration: SamplingConfiguration,
+    ) -> Result<(), BME280Error> {
+        self.sampling_configuration = sampling_configuration;
+
+        let (config, ctrl_meas, ctrl_hum) =
+            self.sampling_configuration.to_low_level_configuration();
+
+        self.write_register_8u(BME280_REGISTER_CONTROL, SensorMode::Sleep as u8)
+            .await?;
+        self.write_register_8u(BME280_REGISTER_CONTROLHUMID, ctrl_hum.into())
+            .await?;
+        self.write_register_8u(BME280_REGISTER_CONFIG, config.into())
+            .await?;
+        self.write_register_8u(BME280_REGISTER_CONTROL, ctrl_meas.into())
+            .await?;
+        self.write_register_8u(BME280_REGISTER_CONTROL, SensorMode::Normal as u8)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn read(&mut self) -> Result<BME280Response, BME280Error> {
+        // let now = embassy_time::Instant::now();
+        // if let Some(last_read_time) = self.last_read_time {
+        //     if now - last_read_time < Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) {
+        //         if let Some(response) = &self.last_response {
+        //             return Ok(response.clone());
+        //         }
+        //     }
+        // } else {
+        //     if now.as_secs() < MIN_REQUEST_INTERVAL_SECS {
+        //         return Err(BME280Error::NoData);
+        //     }
+        // }
+        match self.read_internal().await {
+            Ok(response) => {
+                self.last_response = Some(response.clone());
+                self.last_read_time = Some(embassy_time::Instant::now());
+                Ok(response)
             }
             Err(e) => {
                 if let Some(response) = &self.last_response {
@@ -69,105 +161,72 @@ impl<'a> DHTSensor<'a> {
         }
     }
 
-    fn read_raw_data(&mut self) -> Result<[u16; 5], DHTSensorError> {
-        let mut data: [u16; 5] = [0; 5];
-        let mut all_bits_cycles: [u32; 80] = [0; 80];
+    async fn read_internal(&mut self) -> Result<BME280Response, BME280Error> {
+        let mut data: [u8; BME280_REGISTER_DATA_LENGTH] = [0; BME280_REGISTER_DATA_LENGTH];
+        self.read_registers_bulk(BME280_REGISTER_DATA_START, &mut data)
+            .await?;
 
-        free(|_| {
-            // Wake up the sensor
-            self.pin.set_as_output();
-            self.pin.set_low();
-            block_for(Duration::from_micros(crate::dht::START_LOW_INTERVAL_US));
+        let data_msb = (data[0] as u32) << 12;
+        let data_lsb = (data[1] as u32) << 4;
+        let data_xlsb = (data[2] as u32) >> 4;
+        let adc_p = data_msb | data_lsb | data_xlsb;
 
-            // Ask for data
-            self.pin.set_high();
-            block_for(Duration::from_micros(25u64));
+        let data_msb = (data[3] as u32) << 12;
+        let data_lsb = (data[4] as u32) << 4;
+        let data_xlsb = (data[5] as u32) >> 4;
+        let adc_t = (data_msb | data_lsb | data_xlsb) as i32;
 
-            self.pin.set_as_input();
-            self.pin.set_pull(Pull::Up);
-            block_for(Duration::from_micros(55u64));
+        let data_msb = (data[6] as u32) << 8;
+        let data_lsb = data[7] as u32;
+        let adc_h = data_msb | data_lsb;
 
-            // Wait for DHT to signal data is ready (~80us low followed by ~80us high)
-            _ = self.wait_while_level(Low, WAIT_FOR_READINESS_LEVEL_THRESHOLD);
-            _ = self.wait_while_level(High, WAIT_FOR_READINESS_LEVEL_THRESHOLD);
+        if let Some(cr) = &self.calibration_registers {
+            let t_fine = cr.compensate_temperature(adc_t);
+            let temperature = ((t_fine * 5 + 128) >> 8) as f32 / 100.0;
+            let humidity = cr.compensate_humidity(adc_h as u16, t_fine) as f32 / 1024.0;
+            let pressure = cr.compensate_pressure(adc_p, t_fine) as f32 / 256.0;
 
-            for bit in (0..80).step_by(2) {
-                if let Ok(bit_cycles) = self.wait_while_level(Low, LOW_LEVEL_THRESHOLD) {
-                    all_bits_cycles[bit] = bit_cycles;
-                    if let Ok(bit_cycles) = self.wait_while_level(High, HIGH_LEVEL_THRESHOLD) {
-                        all_bits_cycles[bit + 1] = bit_cycles;
-                    }
-                }
-            }
-
-            self.pin.set_as_output();
-            self.pin.set_high();
-            block_for(Duration::from_micros(1100u64));
-        });
-
-        for i in 0..40 {
-            let low_cycles = all_bits_cycles[2 * i];
-            let high_cycles = all_bits_cycles[2 * i + 1];
-            if low_cycles < LOW_LEVEL_THRESHOLD || high_cycles < HIGH_LEVEL_THRESHOLD {
-                data[i / 8] <<= 1;
-                if high_cycles > low_cycles {
-                    data[i / 8] |= 1;
-                }
-            } else {
-                return Err(DHTSensorError::Timeout);
-            }
-        }
-        let sum = data[0] + data[1] + data[2] + data[3];
-        if data[4] == sum & 0x00FF {
-            Ok(data)
+            Ok(BME280Response {
+                temperature,
+                humidity,
+                pressure,
+            })
         } else {
-            Err(DHTSensorError::ChecksumError)
+            Err(NotCalibrated)
         }
     }
 
-    // Wait for the pin to change from the specified level, or until the timeout is reached.
-    fn wait_while_level(&mut self, level: Level, timeout_us: u32) -> Result<u32, DHTSensorError> {
-        let mut elapsed_us = 0u32;
-        while self.pin.get_level() == level && elapsed_us < timeout_us {
-            block_for(Duration::from_micros(1u64));
-            elapsed_us += 1;
+    async fn read_register_u8(&mut self, register: u8) -> Result<u8, BME280Error> {
+        let mut buf = [0u8; 1];
+        self.i2c_write_read(&[register], &mut buf).await?;
+        Ok(buf[0])
+    }
+
+    async fn write_register_8u(&mut self, register: u8, data: u8) -> Result<(), BME280Error> {
+        self.i2c_write(&[register, data]).await?;
+        Ok(())
+    }
+
+    async fn read_registers_bulk(
+        &mut self,
+        register: u8,
+        read: &mut [u8],
+    ) -> Result<(), BME280Error> {
+        self.i2c_write_read(&[register], read).await?;
+        Ok(())
+    }
+
+    async fn i2c_write_read(&mut self, write: &[u8], read: &mut [u8]) -> Result<(), BME280Error> {
+        match self.i2c.write_read(self.address, write, read).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(BME280Error::I2CError),
         }
-        if elapsed_us >= timeout_us {
-            Err(DHTSensorError::Timeout)
-        } else {
-            Ok(elapsed_us)
+    }
+
+    async fn i2c_write(&mut self, write: &[u8]) -> Result<(), BME280Error> {
+        match self.i2c.write(self.address, write).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(BME280Error::I2CError),
         }
     }
 }
-
-#[cfg(feature = "dht2x")]
-mod dht {
-    pub(crate) fn humidity(data: &[u16; 2]) -> f32 {
-        ((data[0] << 8) | data[1]) as f32 / 10.0
-    }
-
-    pub(crate) fn temperature(data: &[u16; 2]) -> f32 {
-        let mut temperature = (((data[0] & 0x7F) << 8) | data[1]) as f32 / 10.0;
-        if data[0] & 0x80 != 0 {
-            temperature = -temperature;
-        }
-        temperature
-    }
-}
-
-
-#[cfg(feature = "dht1x")]
-mod dht {
-    pub(crate) fn humidity(data: &[u16; 2]) -> f32 {
-        data[0] as f32 + ((data[1] & 0x00FF) as f32 * 0.1)
-    }
-
-    pub(crate) fn temperature(data: &[u16; 2]) -> f32 {
-        let mut temperature = data[0] as f32 + ((data[1] & 0x00FF) as f32 * 0.1);
-        if data[1] & 0x8000 != 0 {
-            temperature = -temperature;
-        }
-        temperature
-    }
-}
-
