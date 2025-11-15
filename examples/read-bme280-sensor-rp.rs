@@ -4,9 +4,7 @@
 use defmt::{error, info};
 use defmt_rtt as _;
 use embassy_bme280_sensor::bme280_rp::BME280Sensor;
-use embassy_bme280_sensor::configuration::{
-    Oversampling, SamplingConfiguration, SensorMode, StandbyDuration,
-};
+use embassy_bme280_sensor::configuration::{Filter, Oversampling, SamplingConfiguration, SensorMode, StandbyDuration};
 use embassy_bme280_sensor::BME280Error;
 use embassy_executor::Spawner;
 use embassy_rp::peripherals::I2C0;
@@ -29,24 +27,30 @@ async fn main(_spawner: Spawner) -> ! {
     let mut i2c = i2c::I2c::new_async(p.I2C0, scl, sda, Irqs, Default::default());
 
     // Create sensor instance
-    let mut sensor = BME280Sensor::new(&mut i2c, 0x76);
+    let mut sensor = BME280Sensor::new(0x76);
 
     // Configure and initialize sensor
-    sensor
-        .setup(
+    match sensor
+        .setup(&mut i2c,
             SamplingConfiguration::default()
-                .with_temperature_oversampling(Oversampling::X1)
-                .with_pressure_oversampling(Oversampling::X1)
-                .with_humidity_oversampling(Oversampling::X1)
+                .with_temperature_oversampling(Oversampling::X4)
+                .with_pressure_oversampling(Oversampling::X4)
+                .with_humidity_oversampling(Oversampling::X4)
                 .with_sensor_mode(SensorMode::Normal)
-                .with_standby_duration(StandbyDuration::Millis1000),
+                .with_standby_duration(StandbyDuration::Millis1000)
+                .with_filter(Filter::X8),
+
         )
-        .await
-        .unwrap();
+        .await {
+        Ok(_) => info!("BME280 sensor initialized successfully"),
+        Err(e) => {
+            error!("Failed to initialize BME280 sensor: ");
+        }
+    }
 
     // Read sensor data
     loop {
-        match sensor.read().await {
+        match sensor.read(&mut i2c).await {
             Ok(data) => {
                 info!(
                     "Temperature: {}°C, Humidity: {}%, Pressure: {} Pa",
