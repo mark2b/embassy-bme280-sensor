@@ -1,30 +1,33 @@
 #![no_std]
 #![no_main]
 
-use defmt::{error, info};
+use log::{error, info};
 use defmt_rtt as _;
 use embassy_bme280_sensor::bme280_rp::BME280Sensor;
 use embassy_bme280_sensor::configuration::{Filter, Oversampling, SamplingConfiguration, SensorMode, StandbyDuration};
 use embassy_bme280_sensor::BME280Error;
 use embassy_executor::Spawner;
-use embassy_rp::peripherals::I2C0;
+use embassy_rp::peripherals::{I2C1, USB};
 use embassy_rp::{bind_interrupts, i2c};
+use embassy_rp::usb::Driver;
 use embassy_time::{Duration, Timer};
 use panic_probe as _;
 
 bind_interrupts!(struct Irqs {
-    I2C0_IRQ => i2c::InterruptHandler<I2C0>;
+    USBCTRL_IRQ =>  embassy_rp::usb::InterruptHandler<USB>;
+    I2C1_IRQ => i2c::InterruptHandler<I2C1>;
 });
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
 
-    let sda = p.PIN_0;
-    let scl = p.PIN_1;
+    let driver = Driver::new(p.USB, Irqs);
+    spawner.spawn(logger_task(driver).unwrap());
 
-    // Configure I2C
-    let mut i2c = i2c::I2c::new_async(p.I2C0, scl, sda, Irqs, Default::default());
+    let sda = p.PIN_26;
+    let scl = p.PIN_27;
+    let mut i2c = i2c::I2c::new_async(p.I2C1, scl, sda, Irqs, Default::default());
 
     // Create sensor instance
     let mut sensor = BME280Sensor::new(0x76);
@@ -44,7 +47,7 @@ async fn main(_spawner: Spawner) -> ! {
         .await {
         Ok(_) => info!("BME280 sensor initialized successfully"),
         Err(e) => {
-            error!("Failed to initialize BME280 sensor: ");
+            error!("Failed to initialize BME280 sensor: {:?} ", e);
         }
     }
 
@@ -68,4 +71,11 @@ async fn main(_spawner: Spawner) -> ! {
 
         Timer::after(Duration::from_secs(1)).await;
     }
+}
+
+
+
+#[embassy_executor::task]
+pub async fn logger_task(driver: Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
 }
